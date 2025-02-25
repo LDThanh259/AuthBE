@@ -14,6 +14,8 @@ using System.Text;
 using AuthApi.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Google;
+using Google.Apis.Auth;
+using Microsoft.AspNetCore.Authorization;
 
 namespace AuthApi.Controllers
 {
@@ -42,405 +44,305 @@ namespace AuthApi.Controllers
 
         [HttpPost]
         [Route("register")]
-        public async Task<IActionResult> Register([FromBody] RegisterRequestDTO model)
+        public async Task<ApiResponse<object>> Register([FromBody] RegisterRequestDTO model)
         {
-            var userExists = await _userManager.FindByNameAsync(model.UserName);
-            if (userExists != null)
-                return StatusCode(StatusCodes.Status500InternalServerError,
-                    new { Status = "Error", Message = "User already exists!" });
-
-            userExists = await _userManager.FindByEmailAsync(model.Email);
-            if (userExists != null)
-                return StatusCode(StatusCodes.Status500InternalServerError,
-                    new { Status = "Error", Message = "User already exists!" });
-
-            User newUser = new User
+            try
             {
-                UserName = model.UserName,
-                Email = model.Email,
-                SecurityStamp = Guid.NewGuid().ToString(),
-            };
+                if (await _userManager.FindByNameAsync(model.UserName) != null)
+                    return ApiResponse<object>.ErrorResult("Tên đăng nhập đã tồn tại");
 
-            var result = await _userManager.CreateAsync(newUser, model.Password);
-            if(!result.Succeeded)
+                if (await _userManager.FindByEmailAsync(model.Email) != null)
+                    return ApiResponse<object>.ErrorResult("Email đã được đăng ký");
+
+                User user = new User
+                {
+                    UserName = model.UserName,
+                    Email = model.Email,
+                    SecurityStamp = Guid.NewGuid().ToString(),
+                };
+                var result = await _userManager.CreateAsync(user, model.Password);
+                if (!result.Succeeded)
+                    return ApiResponse<object>.ErrorResult("Lỗi đăng ký", result.Errors.Select(e => e.Description));
+
+                await _userManager.AddToRoleAsync(user, RoleName.Client);
+                var token = await _userManager.GenerateEmailConfirmationTokenAsync(user);
+                var confirmationLink = Url.Action("ConfirmEmail", "Auth", new { userId = user.Id, token }, Request.Scheme)!;
+                await _emailService.SendActivationEmailAsync(user.Email, confirmationLink);
+
+                return ApiResponse<object>.SuccessResult(null, "Đăng ký thành công. Vui lòng kiểm tra email.");
+            }
+            catch (Exception ex)
             {
-                return BadRequest(result.Errors);
+                _logger.LogError(ex, "Lỗi đăng ký");
+                return ApiResponse<object>.ErrorResult("Lỗi hệ thống");
             }
 
-            if (!await _roleManager.RoleExistsAsync(RoleName.Client))
-            {
-                await _roleManager.CreateAsync(new IdentityRole("Client"));
-            }
-
-            await _userManager.AddToRoleAsync(newUser, RoleName.Client);
-
-            var token = await _userManager.GenerateEmailConfirmationTokenAsync(newUser);
-            var confirmationLink = $"https://localhost:7217/api/Auth/confirm-email?userId={newUser.Id}&token={Uri.EscapeDataString(token)}";
-
-            await _emailService.SendActivationEmailAsync(newUser.Email, confirmationLink);
-
-            return Ok("User registered! Please check your email to confirm.");
         }
 
         [HttpGet("confirm-email")]
         public async Task<IActionResult> ConfirmEmail(string userId, string token)
         {
-            var userExixts = await _userManager.FindByIdAsync(userId);
-            if(userExixts == null)
-            {
-                return BadRequest("Invalid user");
-            }
+            var user = await _userManager.FindByIdAsync(userId);
+            if (user == null) return BadRequest("Người dùng không tồn tại");
 
-            var decodedToken = Uri.UnescapeDataString(token);
-            var result = await _userManager.ConfirmEmailAsync(userExixts, decodedToken);
-            if (result.Succeeded) return Redirect("http://localhost:3000/login");
+            var result = await _userManager.ConfirmEmailAsync(user, Uri.UnescapeDataString(token));
+            if (!result.Succeeded) return BadRequest("Token không hợp lệ");
 
-            return BadRequest("Invalid token or email already confirmed.");
+            return Redirect("http://localhost:3000/login?confirmed=true");
         }
 
         [HttpPost]
         [Route("login")]
-        public async Task<IActionResult> Login([FromBody] LoginRequestDTO model, [FromQuery] string returnUrl = "/")
+        public async Task<ApiResponse<LoginResponseDTO>> Login([FromBody] LoginRequestDTO model)
         {
-            if (!IsValidReturnUrl(returnUrl))
-            {
-                return Redirect($"http://localhost:3000/login?error=Invalid return URL");
-            }
+            var user = await _userManager.FindByNameAsync(model.Identifier)
+                 ?? await _userManager.FindByEmailAsync(model.Identifier);
 
-            var userExists = await _userManager.FindByNameAsync(model.Identified)
-                            ?? await _userManager.FindByEmailAsync(model.Identified);
+            if (user == null || !await _userManager.CheckPasswordAsync(user, model.Password))
+                return ApiResponse<LoginResponseDTO>.ErrorResult("Thông tin đăng nhập không chính xác");
 
-            if (userExists == null)
-            {
-                return Unauthorized("Invalid credentials");
-            }
+            if (!user.EmailConfirmed)
+                return ApiResponse<LoginResponseDTO>.ErrorResult("Vui lòng xác thực email trước");
 
-            if (await _userManager.IsLockedOutAsync(userExists))
-            {
-                return BadRequest("Tài khoản đã bị khóa. Vui lòng thử lại sau.");
-            }
+            // Generate tokens
+            var tokens = await GenerateTokens(user);
+            await _userManager.ResetAccessFailedCountAsync(user);
 
-            if (!await _userManager.CheckPasswordAsync(userExists, model.Password))
-            {
-                await _userManager.AccessFailedAsync(userExists);
-                return Unauthorized("Invalid credentials");
-            }
-
-            var authClaims = new List<Claim>
-            {
-                new Claim(ClaimTypes.Name, userExists.UserName),
-                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
-                new Claim(ClaimTypes.Email, userExists.Email),
-                new Claim(ClaimTypes.NameIdentifier, userExists.Id),
-            };
-
-            var userRoles = await _userManager.GetRolesAsync(userExists);
-            authClaims.AddRange(userRoles.Select(role => new Claim(ClaimTypes.Role, role)));
-
-            var oldTokens = _context.RefreshTokens.Where(rt => rt.UserId == userExists.Id && !rt.IsRevoked);
-            _context.RefreshTokens.RemoveRange(oldTokens);
-
-            var accessToken = CreateAccessToken(authClaims);
-            var refreshToken = CreateRefreshToken();
-
-            var refreshTokenEntity = new RefreshToken
-            {
-                Token = HashToken(refreshToken),
-                UserId = userExists.Id,
-                //Refresh tokens are set to expire after 7 days (you can adjust this as needed).
-                ExpiresAt = DateTime.UtcNow.AddDays(7),
-                CreatedAt = DateTime.UtcNow,
-                IsRevoked = false
-            };
-            // The hashed refresh token, along with associated user and client information, is stored in the RefreshTokens table.
-            _context.RefreshTokens.Add(refreshTokenEntity);
-            await _context.SaveChangesAsync();
-
-            await _userManager.UpdateAsync(userExists);
-            await _userManager.ResetAccessFailedCountAsync(userExists);
-
-            //Response.Cookies.Append("refreshToken", refreshToken, new CookieOptions
-            //{
-            //    HttpOnly = true,
-            //    Secure = false,
-            //    SameSite = SameSiteMode.Lax,
-            //    Expires = DateTime.Now.AddDays(7)
-            //});
-
-            return Ok(new
-            {
-                accessToken,
-                refreshToken,
-                redirectUrl = returnUrl
-            });
+            return ApiResponse<LoginResponseDTO>.SuccessResult(tokens);
         }
 
-
-        [HttpGet("external-login")]
-        public IActionResult ExternalLogin([FromQuery] string returnUrl = "/")
+        [HttpPost("google")]
+        public async Task<ApiResponse<LoginResponseDTO>> GoogleLogin([FromBody] GoogleAuthRequest request)
         {
-            if (!IsValidReturnUrl(returnUrl))
+            try
             {
-                return Redirect($"http://localhost:3000/login?error=Invalid return URL");
-            }
+                const string provider = "Google";
+                var payload = await ValidateGooogleToken(request.Token);
+                var providerKey = payload.Subject;
 
-            var redirectUrl = Url.Action("ExternalLoginCallback", "Auth", new { returnUrl }, protocol: Request.Scheme);
-            var properties = new AuthenticationProperties { RedirectUri = redirectUrl };
-            return Challenge(properties, GoogleDefaults.AuthenticationScheme);
-        }
-
-        [HttpGet("external-login-callback")]
-        public async Task<IActionResult> ExternalLoginCallback([FromQuery] string returnUrl = "/")
-        {
-            var authenticateResult = await HttpContext.AuthenticateAsync(GoogleDefaults.AuthenticationScheme);
-            if(!authenticateResult.Succeeded)
-            {
-                return Redirect($"http://localhost:3000/login?error=Google authentication failed&returnUrl={returnUrl}");
-            }
-
-            //var claims = authenticateResult.Principal.Claims.Select(c => new { c.Type, c.Value });
-            //{
-            //    "claims": [
-            //                      {
-            //                        "type": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier",
-            //          "value": "104275176068529044714"
-            //                      },
-            //        {
-            //                        "type": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
-            //          "value": "Thanh LD"
-            //        },
-            //        {
-            //                        "type": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname",
-            //          "value": "Thanh"
-            //        },
-            //        {
-            //                        "type": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname",
-            //          "value": "LD"
-            //        },
-            //        {
-            //                        "type": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
-            //          "value": "thanhldchatgpt@gmail.com"
-            //        }
-            //      ]
-            //    }
-
-            var email = authenticateResult.Principal.FindFirst(ClaimTypes.Email)?.Value;
-            var name = authenticateResult.Principal.FindFirst(ClaimTypes.Name)?.Value;
-            var providerKey = authenticateResult.Principal.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            var provider = GoogleDefaults.AuthenticationScheme;
-
-            if(string.IsNullOrEmpty(email) || string.IsNullOrEmpty(name))
-            {
-                return Redirect($"http://localhost:3000/login?error=Google authentication failed&returnUrl={returnUrl}");
-            }
-
-            // tìm kiếm trên bảng UserLogin xem có người dùng nào với provider, providerKey
-            var user = await _userManager.FindByLoginAsync(provider, providerKey);
-            if(user == null)
-            {
-                user = await _userManager.FindByEmailAsync(email);
-                if(user == null)
+                var user = await _userManager.FindByLoginAsync(provider, providerKey);
+                if (user == null)
                 {
-                    var sanitizedUsername = name.Replace(" ", "_");
-                    user = new User
+                    user = await _userManager.FindByEmailAsync(payload.Email);
+                    if (user == null)
                     {
-                        UserName = sanitizedUsername,
-                        Email = email,
-                        EmailConfirmed = true
-                    };
+                        var username = !string.IsNullOrEmpty(payload.Name)
+                            ? payload.Name.Replace(" ", "_")
+                            : payload.Email.Split('@')[0];
 
-                    var createResult = await _userManager.CreateAsync(user);
-
-                    if(!createResult.Succeeded)
-                    {
-                        return Redirect($"http://localhost:3000/login?error={createResult.Errors}&returnUrl={returnUrl}");
-                    }
-
-                    if (!await _roleManager.RoleExistsAsync(RoleName.Client))
-                    {
-                        var createRoleResult = await _roleManager.CreateAsync(new IdentityRole(RoleName.Client));
-                        if (!createRoleResult.Succeeded)
+                        user = new User
                         {
-                            return BadRequest(createResult.Errors);
+                            UserName = username,
+                            Email = payload.Email,
+                            EmailConfirmed = true
+                        };
+
+                        var createResult = await _userManager.CreateAsync(user);
+
+                        if (!createResult.Succeeded)
+                        {
+                            return ApiResponse<LoginResponseDTO>.ErrorResult(
+                                "Registration Error",
+                                errors: createResult.Errors
+                                    .Select(e => $"{e.Code}: {e.Description}")
+                                    .ToList()
+                            );
                         }
 
+                        if (!await _roleManager.RoleExistsAsync(RoleName.Client))
+                        {
+                            var createRoleResult = await _roleManager.CreateAsync(new IdentityRole(RoleName.Client));
+                            if (!createRoleResult.Succeeded)
+                            {
+                                return ApiResponse<LoginResponseDTO>.ErrorResult(
+                                    "Create role error",
+                                    createRoleResult.Errors
+                                    .Select(e => $"{e.Code}: {e.Description}")
+                                    .ToList()
+                                );
+                            }
+                        }
+
+                        var addToRoleResult = await _userManager.AddToRoleAsync(user, RoleName.Client);
+                        if (!addToRoleResult.Succeeded)
+                        {
+                            return ApiResponse<LoginResponseDTO>.ErrorResult(
+                                "Add to role Error",
+                                errors: addToRoleResult.Errors
+                                    .Select(e => $"{e.Code}: {e.Description}")
+                                    .ToList()
+                            );
+                        }
                     }
-                    var addToRoleResult = await _userManager.AddToRoleAsync(user, RoleName.Client);
-                    if (!addToRoleResult.Succeeded)
+
+                    var userLoginInfo = new UserLoginInfo(provider, providerKey, "Google");
+                    //lưu vào database bảng UserLogin
+                    var addLoginResult = await _userManager.AddLoginAsync(user, userLoginInfo);
+                    if (!addLoginResult.Succeeded)
                     {
-                        return BadRequest(createResult.Errors);
+                        return ApiResponse<LoginResponseDTO>.ErrorResult(
+                            "Add login Error",
+                            errors: addLoginResult.Errors
+                                .Select(e => $"{e.Code}: {e.Description}")
+                                .ToList()
+                        );
                     }
                 }
 
-                var userLoginInfo = new UserLoginInfo(provider, providerKey, "Google");
-                //lưu vào database bảng UserLogin
-                var addLoginResult = await _userManager.AddLoginAsync(user, userLoginInfo);
-                if (!addLoginResult.Succeeded)
-                {
-                    return BadRequest(addLoginResult.Errors);
-                }
+                var tokens = await GenerateTokens(user);
+                return ApiResponse<LoginResponseDTO>.SuccessResult(tokens);
             }
-
-            var authClaims = new List<Claim>
+            catch (InvalidJwtException ex)
             {
-                new Claim(ClaimTypes.Name, user.UserName),
-                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
-                new Claim(ClaimTypes.Email, user.Email),
-                new Claim(ClaimTypes.NameIdentifier, user.Id),
-            };
-            var userRoles = await _userManager.GetRolesAsync(user);
-            authClaims.AddRange(userRoles.Select(role => new Claim(ClaimTypes.Role, role)));
-
-            var accessToken = CreateAccessToken(authClaims);
-            var refreshToken = CreateRefreshToken();
-
-            var oldTokens = _context.RefreshTokens.Where(rt => rt.UserId == user.Id && !rt.IsRevoked);
-            _context.RefreshTokens.RemoveRange(oldTokens);
-
-            var refreshTokenEntity = new RefreshToken
+                return ApiResponse<LoginResponseDTO>.ErrorResult("Invalid Google token");
+            }
+            catch (Exception ex)
             {
-                Token = HashToken(refreshToken),
-                UserId = user.Id,
-                ExpiresAt = DateTime.UtcNow.AddDays(7),
-                CreatedAt = DateTime.UtcNow,
-                IsRevoked = false
-            };
-            _context.RefreshTokens.Add(refreshTokenEntity);
-            await _context.SaveChangesAsync();
-
-            //Response.Cookies.Append("refreshToken", refreshToken, new CookieOptions
-            //{
-            //    HttpOnly = true,
-            //    Secure = false,
-            //    SameSite = SameSiteMode.Lax,
-            //    Expires = DateTime.UtcNow.AddDays(7)
-            //});
-
-            var redirectUrlWithToken = $"http://localhost:3000{returnUrl}";
-            return Redirect(redirectUrlWithToken);
+                return ApiResponse<LoginResponseDTO>.ErrorResult("An error occurred during login");
+            }
         }
 
-        [HttpPost]
-        [Route("refresh-token")]
-        public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequestDTO model)
+        private async Task<GoogleJsonWebSignature.Payload> ValidateGooogleToken(string token)
+        {
+            var settings = new GoogleJsonWebSignature.ValidationSettings
+            {
+                Audience = new[] { _configuration["Authentication:Google:ClientId"] }
+            };
+
+            return await GoogleJsonWebSignature.ValidateAsync(token, settings);
+        }
+
+        [Authorize]
+        [HttpPost("logout")]
+        public async Task<ApiResponse<object>> Logout([FromBody] LogoutRequestDTO requestDto)
         {
             if (!ModelState.IsValid)
             {
-                return BadRequest(ModelState);
+                return ApiResponse<object>.ErrorResult("Invalid request", ModelState.Values.SelectMany(v => v.Errors.Select(e => e.ErrorMessage)));
             }
 
-            var hashedToken = HashToken(model.RefreshToken);
+            var userIdClaim = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.NameIdentifier);
+            if (userIdClaim == null)
+            {
+                return ApiResponse<object>.ErrorResult("Invalid access token.");
+            }
 
+            string userId = userIdClaim.Value;
+
+            var hashedToken = _tokenService.HashRefreshToken(requestDto.RefreshToken);
             var storedRefreshToken = await _context.RefreshTokens
-                .Include(rf => rf.User)
-                .FirstOrDefaultAsync(rf => rf.Token == hashedToken);
+                .Include(rt => rt.User)
+                .FirstOrDefaultAsync(rt => rt.Token == hashedToken && rt.UserId == userId);
 
             if (storedRefreshToken == null)
             {
-                return Unauthorized("Invalid refresh token.");
-            }
-            if (storedRefreshToken.IsRevoked)
-            {
-                return Unauthorized("Refresh token has been revoked.");
-            }
-            if (storedRefreshToken.ExpiresAt < DateTime.UtcNow)
-            {
-                return Unauthorized("Refresh token has expired.");
+                return ApiResponse<object>.ErrorResult("Invalid refresh token.");
             }
 
-            var user = storedRefreshToken.User;
+            if (storedRefreshToken.IsRevoked)
+            {
+                return ApiResponse<object>.ErrorResult("Refresh token is already revoked.");
+            }
 
             storedRefreshToken.IsRevoked = true;
             storedRefreshToken.RevokedAt = DateTime.UtcNow;
 
-            var authClaims = new List<Claim>
-                {
-                    new Claim(ClaimTypes.Name, user.UserName),
-                    new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
-                    new Claim(ClaimTypes.Email, user.Email),
-                    new Claim(ClaimTypes.NameIdentifier, user.Id),
-                };
-            var userRoles = await _userManager.GetRolesAsync(user);
-            authClaims.AddRange(userRoles.Select(role => new Claim(ClaimTypes.Role, role)));
+            await _context.SaveChangesAsync();
 
-            var accessToken = CreateAccessToken(authClaims);
-            var refreshToken = CreateRefreshToken();
+            return ApiResponse<object>.SuccessResult(null, "Logout successful. Refresh token has been revoked.");
+        }
 
-            var hashedNewRefreshToken = HashToken(refreshToken);
-            var newRefreshTokenEntity = new RefreshToken
+        [HttpPost("refresh-token")]
+        public async Task<ApiResponse<LoginResponseDTO>> RefreshToken(RefreshTokenRequestDTO model)
+        {
+            try
             {
-                Token = hashedNewRefreshToken,
-                UserId = user.Id,
-                ExpiresAt = DateTime.UtcNow.AddDays(7), // Adjust as needed
-                CreatedAt = DateTime.UtcNow,
-                IsRevoked = false
+                // Validate input
+                if (string.IsNullOrEmpty(model.RefreshToken))
+                    return ApiResponse<LoginResponseDTO>.ErrorResult("Refresh token is required");
+
+                // Hash and validate token
+                var hashedToken = _tokenService.HashRefreshToken(model.RefreshToken);
+                var storedToken = await _context.RefreshTokens
+                    .Include(rt => rt.User)
+                    .FirstOrDefaultAsync(rt =>
+                        rt.Token == hashedToken &&
+                        !rt.IsRevoked &&
+                        rt.ExpiresAt > DateTime.UtcNow);
+
+                // Token validation
+                if (storedToken == null)
+                    return ApiResponse<LoginResponseDTO>.ErrorResult("Invalid or expired refresh token");
+
+                if (storedToken.User == null)
+                    return ApiResponse<LoginResponseDTO>.ErrorResult("User not found");
+
+                // Revoke current refresh token
+                storedToken.IsRevoked = true;
+                storedToken.RevokedAt = DateTime.UtcNow;
+                _context.RefreshTokens.Update(storedToken);
+
+                // Generate new tokens
+                var newTokens = await GenerateTokens(storedToken.User);
+
+                // Persist changes
+                await _context.SaveChangesAsync();
+
+                return ApiResponse<LoginResponseDTO>.SuccessResult(newTokens, "Token refreshed");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Refresh token error");
+                return ApiResponse<LoginResponseDTO>.ErrorResult("Internal server error");
+            }
+        }
+
+
+        private async Task<LoginResponseDTO> GenerateTokens(User user)
+        {
+            var claims = new List<Claim>
+            {
+                new(ClaimTypes.Name, user.UserName),
+                new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                new(ClaimTypes.Email, user.Email),
+                new(ClaimTypes.NameIdentifier, user.Id)
             };
-            // Store the new refresh token
-            _context.RefreshTokens.Add(newRefreshTokenEntity);
+            claims.AddRange((await _userManager.GetRolesAsync(user)).Select(r => new Claim(ClaimTypes.Role, r)));
 
-            //Response.Cookies.Append("refreshToken", refreshToken, new CookieOptions
-            //{
-            //    HttpOnly = true,
-            //    Secure = false,
-            //    SameSite = SameSiteMode.Lax,
-            //    Expires = DateTime.Now.AddDays(7)
-            //});
+            // Token generation
+            var accessToken = _tokenService.GenerateAccessToken(claims);
+            var refreshToken = _tokenService.GenerateRefreshToken();
 
-            return Ok(new
+            // Revoke old tokens
+            await RevokeOldRefreshTokens(user.Id);
+            await SaveRefreshToken(user.Id, refreshToken);
+
+            return new LoginResponseDTO
             {
-                accessToken,
-                refreshToken,
+                AccessToken = accessToken,
+                RefreshToken = refreshToken,
+            };
+        }
+
+        private async Task RevokeOldRefreshTokens(string userId)
+        {
+            var oldTokens = await _context.RefreshTokens
+                .Where(rt => rt.UserId == userId && !rt.IsRevoked)
+                .ToListAsync();
+            _context.RefreshTokens.RemoveRange(oldTokens);
+            await _context.SaveChangesAsync();
+        }
+
+        private async Task SaveRefreshToken(string userId, string refreshToken)
+        {
+            _context.RefreshTokens.Add(new RefreshToken
+            {
+                Token = _tokenService.HashRefreshToken(refreshToken),
+                UserId = userId,
+                ExpiresAt = DateTime.UtcNow.AddDays(7),
+                CreatedAt = DateTime.UtcNow
             });
-        }
-
-        private string CreateRefreshToken()
-        {
-            var random = new byte[32];
-
-            using (var rng = RandomNumberGenerator.Create())
-            {
-                rng.GetBytes(random);
-
-                return Convert.ToBase64String(random);
-            }
-        }
-
-        private string CreateAccessToken(List<Claim> authClaims)
-        {
-            var authSingningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["JWT:Secret"]));
-
-            var token = new JwtSecurityToken(
-                issuer: _configuration["JWT:ValidIssuer"],
-                audience: _configuration["JWT:ValidAudience"],
-                expires: DateTime.Now.AddMinutes(_configuration.GetValue<double>("JWT:TokenValidityInMinutes")),
-                claims: authClaims,
-                signingCredentials: new SigningCredentials(authSingningKey, SecurityAlgorithms.HmacSha256)
-             );
-
-            return new JwtSecurityTokenHandler().WriteToken(token);
-        }
-
-        private string HashToken(string token)
-        {
-            using var sha256 = SHA256.Create();
-            var hashedBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
-            return Convert.ToBase64String(hashedBytes);
-
-            //var salt = new byte[16];
-            //RandomNumberGenerator.Fill(salt);
-            //using var sha256 = SHA256.Create();
-            //var combinedBytes = Encoding.UTF8.GetBytes(token).Concat(salt).ToArray();
-            //return Convert.ToBase64String(sha256.ComputeHash(combinedBytes)) + ":" + Convert.ToBase64String(salt);
-        }
-
-        private bool IsValidReturnUrl(string returnUrl)
-        {
-            var allowedHosts = new List<string> { "localhost:3000", "yourdomain.com" };
-            if (Uri.TryCreate(returnUrl, UriKind.Absolute, out Uri uri))
-            {
-                return allowedHosts.Contains(uri.Host);
-            }
-            return returnUrl.StartsWith("/");
+            await _context.SaveChangesAsync();
         }
 
     }

@@ -2,7 +2,7 @@
 {
     public class LoginRequestDTO
     {
-        public string Identified { get; set; }
+        public string Identifier { get; set; }
         public string Password { get; set; }
     }
 }
