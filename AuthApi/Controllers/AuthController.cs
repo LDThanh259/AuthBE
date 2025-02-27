@@ -16,6 +16,8 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Google;
 using Google.Apis.Auth;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Hosting.Server;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace AuthApi.Controllers
 {
@@ -109,6 +111,45 @@ namespace AuthApi.Controllers
             await _userManager.ResetAccessFailedCountAsync(user);
 
             return ApiResponse<LoginResponseDTO>.SuccessResult(tokens);
+        }
+        [Authorize]
+        [HttpGet("validate")]
+        public async Task<ApiResponse<UserResponseDTO>> ValidateToken()
+        {
+            try
+            {
+                var user = HttpContext.User;
+
+                var userId = user.Claims.FirstOrDefault(c => c.Type == ClaimTypes.NameIdentifier)?.Value;
+                var username = user.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Name)?.Value;
+                var email = user.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Email)?.Value;
+                var roles = user.Claims.Where(c => c.Type == ClaimTypes.Role)
+                                       .Select(c => c.Value)
+                                       .ToList();
+
+                var userData = new UserResponseDTO
+                {
+                    Id = userId,
+                    Username = username,
+                    Email = email,
+                    Roles = roles
+                };
+
+                return ApiResponse<UserResponseDTO>.SuccessResult
+                (
+                    userData
+                );
+            }
+            catch (SecurityTokenException ex)
+            {
+                _logger.LogError(ex, "Invalid token");
+                return ApiResponse<UserResponseDTO>.ErrorResult(ex.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Token validation error");
+                return ApiResponse<UserResponseDTO>.ErrorResult("Internal server error");
+            }
         }
 
         [HttpPost("google")]
@@ -213,14 +254,9 @@ namespace AuthApi.Controllers
         }
 
         [Authorize]
-        [HttpPost("logout")]
-        public async Task<ApiResponse<object>> Logout([FromBody] LogoutRequestDTO requestDto)
+        [HttpGet("logout")]
+        public async Task<ApiResponse<object>> Logout()
         {
-            if (!ModelState.IsValid)
-            {
-                return ApiResponse<object>.ErrorResult("Invalid request", ModelState.Values.SelectMany(v => v.Errors.Select(e => e.ErrorMessage)));
-            }
-
             var userIdClaim = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.NameIdentifier);
             if (userIdClaim == null)
             {
@@ -229,23 +265,16 @@ namespace AuthApi.Controllers
 
             string userId = userIdClaim.Value;
 
-            var hashedToken = _tokenService.HashRefreshToken(requestDto.RefreshToken);
             var storedRefreshToken = await _context.RefreshTokens
                 .Include(rt => rt.User)
-                .FirstOrDefaultAsync(rt => rt.Token == hashedToken && rt.UserId == userId);
+                .Where(rt => rt.UserId == userId && !rt.IsRevoked)
+                .ToListAsync();
 
-            if (storedRefreshToken == null)
+            foreach (var refreshToken in storedRefreshToken)
             {
-                return ApiResponse<object>.ErrorResult("Invalid refresh token.");
+                refreshToken.IsRevoked = true;
+                refreshToken.RevokedAt = DateTime.Now;
             }
-
-            if (storedRefreshToken.IsRevoked)
-            {
-                return ApiResponse<object>.ErrorResult("Refresh token is already revoked.");
-            }
-
-            storedRefreshToken.IsRevoked = true;
-            storedRefreshToken.RevokedAt = DateTime.UtcNow;
 
             await _context.SaveChangesAsync();
 
@@ -309,12 +338,13 @@ namespace AuthApi.Controllers
             };
             claims.AddRange((await _userManager.GetRolesAsync(user)).Select(r => new Claim(ClaimTypes.Role, r)));
 
+            // Revoke old tokens
+            await RevokeOldRefreshTokens(user.Id);
+
             // Token generation
             var accessToken = _tokenService.GenerateAccessToken(claims);
             var refreshToken = _tokenService.GenerateRefreshToken();
 
-            // Revoke old tokens
-            await RevokeOldRefreshTokens(user.Id);
             await SaveRefreshToken(user.Id, refreshToken);
 
             return new LoginResponseDTO
@@ -329,7 +359,13 @@ namespace AuthApi.Controllers
             var oldTokens = await _context.RefreshTokens
                 .Where(rt => rt.UserId == userId && !rt.IsRevoked)
                 .ToListAsync();
-            _context.RefreshTokens.RemoveRange(oldTokens);
+
+            foreach (var token in oldTokens)
+            {
+                token.IsRevoked = true;
+                token.RevokedAt = DateTime.Now;
+            }
+
             await _context.SaveChangesAsync();
         }
 
